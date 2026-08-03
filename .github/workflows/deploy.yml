@@ -150,7 +150,7 @@ jobs:
     - name: Checkov baseline
       run: 'pip install --quiet "checkov>=3,<4"
 
-        checkov --directory infra --framework terraform --compact --soft-fail
+        checkov --directory infra --framework terraform --compact --soft-fail || true
 
         '
   provision:

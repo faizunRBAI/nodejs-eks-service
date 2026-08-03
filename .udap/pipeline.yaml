@@ -206,9 +206,12 @@ stages:
         with:
           python-version: '3.12'
       - name: Checkov baseline
+        # checkov>=3 does not guarantee exit 0 even with --soft-fail on some
+        # check classes. Append || true so this advisory scan never blocks a
+        # deploy — Trivy is the hard gate above.
         run: |
           pip install --quiet "checkov>=3,<4"
-          checkov --directory infra --framework terraform --compact --soft-fail
+          checkov --directory infra --framework terraform --compact --soft-fail || true
 
   # ── Infrastructure ──────────────────────────────────────────────────────────
 
@@ -420,8 +423,7 @@ stages:
           kubectl delete job db-migrate --namespace "$NAMESPACE" --ignore-not-found
       - name: Apply remaining Kubernetes manifests
         # The migration job and serviceaccount were applied above; apply
-        # everything else (deployment, service, hpa, pdb). Glob excludes
-        # db-migrate-job.yaml and serviceaccount.yaml to avoid redundant applies.
+        # everything else (deployment, service, hpa, pdb).
         run: |
           set -euo pipefail
           NAMESPACE="${{ secrets.PROJECT_NAME }}"
