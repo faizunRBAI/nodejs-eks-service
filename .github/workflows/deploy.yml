@@ -290,42 +290,42 @@ jobs:
         \ \\\n  --region \"$AWS_REGION\"\n"
     - name: Install the metrics server
       run: "kubectl apply -f \\\n  https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml\n"
-    - name: Apply Kubernetes manifests
+    - name: Bootstrap namespace and secrets
       run: "set -euo pipefail\nNAMESPACE=\"${{ secrets.PROJECT_NAME }}\"\nIMAGE_TAG=\"\
         ${GITHUB_SHA::12}\"\nACCOUNT_ID=\"$(aws sts get-caller-identity --query Account\
         \ --output text)\"\nIMAGE=\"${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${IMAGE_TAG}\"\
-        \n\nkubectl create namespace \"$NAMESPACE\" --dry-run=client -o yaml | kubectl\
-        \ apply -f -\n\nif [ -n \"${DB_URL:-}\" ]; then\n  kubectl create secret generic\
-        \ app-database \\\n    --namespace \"$NAMESPACE\" \\\n    --from-literal=DATABASE_URL=\"\
-        ${DB_URL}\" \\\n    --dry-run=client -o yaml | kubectl apply -f -\nelse\n\
-        \  kubectl delete secret app-database --namespace \"$NAMESPACE\" --ignore-not-found\n\
-        fi\n\nfor manifest in k8s/*.yaml; do\n  sed -e \"s|%%NAMESPACE%%|${NAMESPACE}|g\"\
-        \ \\\n      -e \"s|%%IMAGE_TAG%%|${IMAGE_TAG}|g\" \\\n      -e \"s|%%IMAGE%%|${IMAGE}|g\"\
-        \ \\\n      \"$manifest\" | kubectl apply -f -\ndone\n"
+        \necho \"IMAGE=${IMAGE}\" >> \"$GITHUB_ENV\"\necho \"NAMESPACE=${NAMESPACE}\"\
+        \ >> \"$GITHUB_ENV\"\n\nkubectl create namespace \"$NAMESPACE\" --dry-run=client\
+        \ -o yaml | kubectl apply -f -\n\nif [ -n \"${DB_URL:-}\" ]; then\n  kubectl\
+        \ create secret generic app-database \\\n    --namespace \"$NAMESPACE\" \\\
+        \n    --from-literal=DATABASE_URL=\"${DB_URL}\" \\\n    --dry-run=client -o\
+        \ yaml | kubectl apply -f -\nelse\n  kubectl delete secret app-database --namespace\
+        \ \"$NAMESPACE\" --ignore-not-found\nfi\n\n# Apply the service account so\
+        \ the migration job can reference it.\nsed -e \"s|%%NAMESPACE%%|${NAMESPACE}|g\"\
+        \ \\\n    k8s/serviceaccount.yaml | kubectl apply -f -\n"
     - name: Run database migrations inside the cluster
       run: "set -euo pipefail\nNAMESPACE=\"${{ secrets.PROJECT_NAME }}\"\n\nif [ -z\
         \ \"${DB_URL:-}\" ]; then\n  echo \"No database configured \u2014 skipping\
-        \ migrations.\"\n  exit 0\nfi\n\nACCOUNT_ID=\"$(aws sts get-caller-identity\
-        \ --query Account --output text)\"\nIMAGE=\"${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${GITHUB_SHA::12}\"\
-        \n\n# Delete any leftover job from a previous run so apply is idempotent.\n\
-        kubectl delete job db-migrate --namespace \"$NAMESPACE\" --ignore-not-found\n\
-        \nkubectl create job db-migrate \\\n  --namespace \"$NAMESPACE\" \\\n  --image\
-        \ \"$IMAGE\" \\\n  -- node -e \"\n    const fs = require('fs');\n    const\
-        \ { Pool } = require('pg');\n    const sql = fs.readFileSync('db/migrations/001_create_items.sql',\
-        \ 'utf8');\n    const pool = new Pool({\n      connectionString: process.env.DATABASE_URL,\n\
-        \      ssl: { rejectUnauthorized: false }\n    });\n    pool.query(sql).then(()\
-        \ => {\n      console.log('Migration complete');\n      return pool.end();\n\
-        \    }).then(() => process.exit(0)).catch(err => {\n      console.error('Migration\
-        \ failed:', err.message);\n      process.exit(1);\n    });\n  \"\n\n# Patch\
-        \ the job to read DATABASE_URL from the app-database secret.\nkubectl patch\
-        \ job db-migrate --namespace \"$NAMESPACE\" --type=json \\\n  -p='[{\"op\"\
-        :\"add\",\"path\":\"/spec/template/spec/containers/0/env\",\"value\":[{\"\
-        name\":\"DATABASE_URL\",\"valueFrom\":{\"secretKeyRef\":{\"name\":\"app-database\"\
-        ,\"key\":\"DATABASE_URL\"}}}]}]'\n\n# Wait up to 5 minutes for the migration\
-        \ pod to complete.\nkubectl wait job/db-migrate \\\n  --namespace \"$NAMESPACE\"\
+        \ migrations.\"\n  exit 0\nfi\n\nIMAGE_TAG=\"${GITHUB_SHA::12}\"\nACCOUNT_ID=\"\
+        $(aws sts get-caller-identity --query Account --output text)\"\nIMAGE=\"${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${IMAGE_TAG}\"\
+        \n\n# Delete any leftover job from a previous run (idempotency).\nkubectl\
+        \ delete job db-migrate --namespace \"$NAMESPACE\" --ignore-not-found --wait=true\n\
+        \n# Apply the migration job manifest with placeholders substituted.\nsed -e\
+        \ \"s|%%NAMESPACE%%|${NAMESPACE}|g\" \\\n    -e \"s|%%IMAGE%%|${IMAGE}|g\"\
+        \ \\\n    k8s/db-migrate-job.yaml | kubectl apply -f -\n\n# Wait up to 5 minutes\
+        \ for completion.\nkubectl wait job/db-migrate \\\n  --namespace \"$NAMESPACE\"\
         \ \\\n  --for=condition=complete \\\n  --timeout=300s\n\necho \"Migration\
         \ job completed.\"\nkubectl logs job/db-migrate --namespace \"$NAMESPACE\"\
-        \ || true\n"
+        \ || true\n\n# Clean up the completed job so it does not accumulate across\
+        \ deploys.\nkubectl delete job db-migrate --namespace \"$NAMESPACE\" --ignore-not-found\n"
+    - name: Apply remaining Kubernetes manifests
+      run: "set -euo pipefail\nNAMESPACE=\"${{ secrets.PROJECT_NAME }}\"\nIMAGE_TAG=\"\
+        ${GITHUB_SHA::12}\"\nACCOUNT_ID=\"$(aws sts get-caller-identity --query Account\
+        \ --output text)\"\nIMAGE=\"${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${IMAGE_TAG}\"\
+        \n\nfor manifest in k8s/deployment.yaml k8s/service.yaml k8s/hpa.yaml k8s/poddisruptionbudget.yaml;\
+        \ do\n  sed -e \"s|%%NAMESPACE%%|${NAMESPACE}|g\" \\\n      -e \"s|%%IMAGE_TAG%%|${IMAGE_TAG}|g\"\
+        \ \\\n      -e \"s|%%IMAGE%%|${IMAGE}|g\" \\\n      \"$manifest\" | kubectl\
+        \ apply -f -\ndone\n"
     - name: Wait for the rollout
       run: "kubectl rollout status deployment/api \\\n  --namespace \"${{ secrets.PROJECT_NAME\
         \ }}\" \\\n  --timeout=10m\n"

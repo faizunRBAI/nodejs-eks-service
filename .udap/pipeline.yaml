@@ -356,13 +356,15 @@ stages:
         run: |
           kubectl apply -f \
             https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
-      - name: Apply Kubernetes manifests
+      - name: Bootstrap namespace and secrets
         run: |
           set -euo pipefail
           NAMESPACE="${{ secrets.PROJECT_NAME }}"
           IMAGE_TAG="${GITHUB_SHA::12}"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${IMAGE_TAG}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          echo "NAMESPACE=${NAMESPACE}" >> "$GITHUB_ENV"
 
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
@@ -375,20 +377,15 @@ stages:
             kubectl delete secret app-database --namespace "$NAMESPACE" --ignore-not-found
           fi
 
-          for manifest in k8s/*.yaml; do
-            sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
-                -e "s|%%IMAGE_TAG%%|${IMAGE_TAG}|g" \
-                -e "s|%%IMAGE%%|${IMAGE}|g" \
-                "$manifest" | kubectl apply -f -
-          done
+          # Apply the service account so the migration job can reference it.
+          sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
+              k8s/serviceaccount.yaml | kubectl apply -f -
       - name: Run database migrations inside the cluster
-        # The RDS instance is in private subnets; only the EKS node security
-        # group is permitted on port 5432. A psql run from the CI runner
-        # (public internet) times out. Solution: run a one-shot pod inside the
-        # cluster using the same app image (which has the migration SQL embedded),
-        # reading DATABASE_URL from the app-database Secret already applied above.
-        # The pod exits 0 on success; kubectl wait ensures the job is complete
-        # before the rollout continues.
+        # The RDS instance is in private subnets — only the EKS node security
+        # group is permitted on port 5432. Migrations run as a one-shot
+        # Kubernetes Job (k8s/db-migrate-job.yaml) using the app image, reading
+        # DATABASE_URL from the app-database Secret applied above. Skipped when
+        # no database is configured.
         run: |
           set -euo pipefail
           NAMESPACE="${{ secrets.PROJECT_NAME }}"
@@ -398,37 +395,19 @@ stages:
             exit 0
           fi
 
+          IMAGE_TAG="${GITHUB_SHA::12}"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${GITHUB_SHA::12}"
+          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${IMAGE_TAG}"
 
-          # Delete any leftover job from a previous run so apply is idempotent.
-          kubectl delete job db-migrate --namespace "$NAMESPACE" --ignore-not-found
+          # Delete any leftover job from a previous run (idempotency).
+          kubectl delete job db-migrate --namespace "$NAMESPACE" --ignore-not-found --wait=true
 
-          kubectl create job db-migrate \
-            --namespace "$NAMESPACE" \
-            --image "$IMAGE" \
-            -- node -e "
-              const fs = require('fs');
-              const { Pool } = require('pg');
-              const sql = fs.readFileSync('db/migrations/001_create_items.sql', 'utf8');
-              const pool = new Pool({
-                connectionString: process.env.DATABASE_URL,
-                ssl: { rejectUnauthorized: false }
-              });
-              pool.query(sql).then(() => {
-                console.log('Migration complete');
-                return pool.end();
-              }).then(() => process.exit(0)).catch(err => {
-                console.error('Migration failed:', err.message);
-                process.exit(1);
-              });
-            "
+          # Apply the migration job manifest with placeholders substituted.
+          sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
+              -e "s|%%IMAGE%%|${IMAGE}|g" \
+              k8s/db-migrate-job.yaml | kubectl apply -f -
 
-          # Patch the job to read DATABASE_URL from the app-database secret.
-          kubectl patch job db-migrate --namespace "$NAMESPACE" --type=json \
-            -p='[{"op":"add","path":"/spec/template/spec/containers/0/env","value":[{"name":"DATABASE_URL","valueFrom":{"secretKeyRef":{"name":"app-database","key":"DATABASE_URL"}}}]}]'
-
-          # Wait up to 5 minutes for the migration pod to complete.
+          # Wait up to 5 minutes for completion.
           kubectl wait job/db-migrate \
             --namespace "$NAMESPACE" \
             --for=condition=complete \
@@ -436,6 +415,26 @@ stages:
 
           echo "Migration job completed."
           kubectl logs job/db-migrate --namespace "$NAMESPACE" || true
+
+          # Clean up the completed job so it does not accumulate across deploys.
+          kubectl delete job db-migrate --namespace "$NAMESPACE" --ignore-not-found
+      - name: Apply remaining Kubernetes manifests
+        # The migration job and serviceaccount were applied above; apply
+        # everything else (deployment, service, hpa, pdb). Glob excludes
+        # db-migrate-job.yaml and serviceaccount.yaml to avoid redundant applies.
+        run: |
+          set -euo pipefail
+          NAMESPACE="${{ secrets.PROJECT_NAME }}"
+          IMAGE_TAG="${GITHUB_SHA::12}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${IMAGE_TAG}"
+
+          for manifest in k8s/deployment.yaml k8s/service.yaml k8s/hpa.yaml k8s/poddisruptionbudget.yaml; do
+            sed -e "s|%%NAMESPACE%%|${NAMESPACE}|g" \
+                -e "s|%%IMAGE_TAG%%|${IMAGE_TAG}|g" \
+                -e "s|%%IMAGE%%|${IMAGE}|g" \
+                "$manifest" | kubectl apply -f -
+          done
       - name: Wait for the rollout
         run: |
           kubectl rollout status deployment/api \
