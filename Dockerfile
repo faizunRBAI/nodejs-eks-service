@@ -60,6 +60,9 @@ COPY --from=deps --chown=app:app /rds-global-bundle.pem ./certs/rds-global-bundl
 COPY --chown=app:app package.json ./
 COPY --chown=app:app src ./src
 COPY --chown=app:app public ./public
+# Migration SQL files must be present in the image — migrate.js reads them
+# at runtime inside the db-migrate Kubernetes Job (node src/migrate.js).
+COPY --chown=app:app db ./db
 
 USER app
 

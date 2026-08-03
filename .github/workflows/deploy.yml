@@ -313,11 +313,20 @@ jobs:
         \n# Apply the migration job manifest with placeholders substituted.\nsed -e\
         \ \"s|%%NAMESPACE%%|${NAMESPACE}|g\" \\\n    -e \"s|%%IMAGE%%|${IMAGE}|g\"\
         \ \\\n    k8s/db-migrate-job.yaml | kubectl apply -f -\n\n# Wait up to 5 minutes\
-        \ for completion.\nkubectl wait job/db-migrate \\\n  --namespace \"$NAMESPACE\"\
-        \ \\\n  --for=condition=complete \\\n  --timeout=300s\n\necho \"Migration\
-        \ job completed.\"\nkubectl logs job/db-migrate --namespace \"$NAMESPACE\"\
-        \ || true\n\n# Clean up the completed job so it does not accumulate across\
-        \ deploys.\nkubectl delete job db-migrate --namespace \"$NAMESPACE\" --ignore-not-found\n"
+        \ for the job to complete.\n# On timeout, dump the pod logs and describe output\
+        \ so the root cause\n# is visible in CI without needing to re-run the pipeline.\n\
+        if ! kubectl wait job/db-migrate \\\n      --namespace \"$NAMESPACE\" \\\n\
+        \      --for=condition=complete \\\n      --timeout=300s; then\n  echo \"\
+        ::error::Migration job did not complete within 5 minutes.\"\n  echo \"---\
+        \ pod logs ---\"\n  kubectl logs job/db-migrate --namespace \"$NAMESPACE\"\
+        \ --tail=100 || true\n  echo \"--- job description ---\"\n  kubectl describe\
+        \ job/db-migrate --namespace \"$NAMESPACE\" || true\n  echo \"--- pod events\
+        \ ---\"\n  kubectl get events --namespace \"$NAMESPACE\" \\\n    --field-selector\
+        \ reason!=Normal --sort-by='.lastTimestamp' || true\n  exit 1\nfi\n\necho\
+        \ \"Migration job completed successfully.\"\nkubectl logs job/db-migrate --namespace\
+        \ \"$NAMESPACE\" || true\n\n# Clean up the completed job so it does not accumulate\
+        \ across deploys.\nkubectl delete job db-migrate --namespace \"$NAMESPACE\"\
+        \ --ignore-not-found\n"
     - name: Apply remaining Kubernetes manifests
       run: "set -euo pipefail\nNAMESPACE=\"${{ secrets.PROJECT_NAME }}\"\nIMAGE_TAG=\"\
         ${GITHUB_SHA::12}\"\nACCOUNT_ID=\"$(aws sts get-caller-identity --query Account\

@@ -387,8 +387,10 @@ stages:
         # The RDS instance is in private subnets — only the EKS node security
         # group is permitted on port 5432. Migrations run as a one-shot
         # Kubernetes Job (k8s/db-migrate-job.yaml) using the app image, reading
-        # DATABASE_URL from the app-database Secret applied above. Skipped when
-        # no database is configured.
+        # DATABASE_URL from the app-database Secret applied above.
+        # The db/ directory is copied into the image (see Dockerfile) so
+        # migrate.js can read the SQL files at runtime. Skipped when no
+        # database is configured.
         run: |
           set -euo pipefail
           NAMESPACE="${{ secrets.PROJECT_NAME }}"
@@ -410,13 +412,25 @@ stages:
               -e "s|%%IMAGE%%|${IMAGE}|g" \
               k8s/db-migrate-job.yaml | kubectl apply -f -
 
-          # Wait up to 5 minutes for completion.
-          kubectl wait job/db-migrate \
-            --namespace "$NAMESPACE" \
-            --for=condition=complete \
-            --timeout=300s
+          # Wait up to 5 minutes for the job to complete.
+          # On timeout, dump the pod logs and describe output so the root cause
+          # is visible in CI without needing to re-run the pipeline.
+          if ! kubectl wait job/db-migrate \
+                --namespace "$NAMESPACE" \
+                --for=condition=complete \
+                --timeout=300s; then
+            echo "::error::Migration job did not complete within 5 minutes."
+            echo "--- pod logs ---"
+            kubectl logs job/db-migrate --namespace "$NAMESPACE" --tail=100 || true
+            echo "--- job description ---"
+            kubectl describe job/db-migrate --namespace "$NAMESPACE" || true
+            echo "--- pod events ---"
+            kubectl get events --namespace "$NAMESPACE" \
+              --field-selector reason!=Normal --sort-by='.lastTimestamp' || true
+            exit 1
+          fi
 
-          echo "Migration job completed."
+          echo "Migration job completed successfully."
           kubectl logs job/db-migrate --namespace "$NAMESPACE" || true
 
           # Clean up the completed job so it does not accumulate across deploys.
