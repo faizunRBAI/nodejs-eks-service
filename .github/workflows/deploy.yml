@@ -285,13 +285,6 @@ jobs:
         No database in this configuration \u2014 the service will run stateless.\"\
         \nfi\necho \"DB_URL=${DB_URL}\" >> \"$GITHUB_ENV\"\n"
       working-directory: infra
-    - name: Run database migrations
-      run: "if [ -n \"${DB_URL:-}\" ]; then\n  echo \"Running database migrations...\"\
-        \n  PGSSLMODE=require psql \"${DB_URL}\" -f db/migrations/001_create_items.sql\n\
-        \  echo \"Migrations complete.\"\nelse\n  echo \"No database configured \u2014\
-        \ skipping migrations.\"\nfi\n"
-      env:
-        DB_URL: ${{ env.DB_URL }}
     - name: Configure cluster access
       run: "aws eks update-kubeconfig \\\n  --name \"${{ secrets.PROJECT_NAME }}-eks\"\
         \ \\\n  --region \"$AWS_REGION\"\n"
@@ -309,6 +302,30 @@ jobs:
         fi\n\nfor manifest in k8s/*.yaml; do\n  sed -e \"s|%%NAMESPACE%%|${NAMESPACE}|g\"\
         \ \\\n      -e \"s|%%IMAGE_TAG%%|${IMAGE_TAG}|g\" \\\n      -e \"s|%%IMAGE%%|${IMAGE}|g\"\
         \ \\\n      \"$manifest\" | kubectl apply -f -\ndone\n"
+    - name: Run database migrations inside the cluster
+      run: "set -euo pipefail\nNAMESPACE=\"${{ secrets.PROJECT_NAME }}\"\n\nif [ -z\
+        \ \"${DB_URL:-}\" ]; then\n  echo \"No database configured \u2014 skipping\
+        \ migrations.\"\n  exit 0\nfi\n\nACCOUNT_ID=\"$(aws sts get-caller-identity\
+        \ --query Account --output text)\"\nIMAGE=\"${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${NAMESPACE}:${GITHUB_SHA::12}\"\
+        \n\n# Delete any leftover job from a previous run so apply is idempotent.\n\
+        kubectl delete job db-migrate --namespace \"$NAMESPACE\" --ignore-not-found\n\
+        \nkubectl create job db-migrate \\\n  --namespace \"$NAMESPACE\" \\\n  --image\
+        \ \"$IMAGE\" \\\n  -- node -e \"\n    const fs = require('fs');\n    const\
+        \ { Pool } = require('pg');\n    const sql = fs.readFileSync('db/migrations/001_create_items.sql',\
+        \ 'utf8');\n    const pool = new Pool({\n      connectionString: process.env.DATABASE_URL,\n\
+        \      ssl: { rejectUnauthorized: false }\n    });\n    pool.query(sql).then(()\
+        \ => {\n      console.log('Migration complete');\n      return pool.end();\n\
+        \    }).then(() => process.exit(0)).catch(err => {\n      console.error('Migration\
+        \ failed:', err.message);\n      process.exit(1);\n    });\n  \"\n\n# Patch\
+        \ the job to read DATABASE_URL from the app-database secret.\nkubectl patch\
+        \ job db-migrate --namespace \"$NAMESPACE\" --type=json \\\n  -p='[{\"op\"\
+        :\"add\",\"path\":\"/spec/template/spec/containers/0/env\",\"value\":[{\"\
+        name\":\"DATABASE_URL\",\"valueFrom\":{\"secretKeyRef\":{\"name\":\"app-database\"\
+        ,\"key\":\"DATABASE_URL\"}}}]}]'\n\n# Wait up to 5 minutes for the migration\
+        \ pod to complete.\nkubectl wait job/db-migrate \\\n  --namespace \"$NAMESPACE\"\
+        \ \\\n  --for=condition=complete \\\n  --timeout=300s\n\necho \"Migration\
+        \ job completed.\"\nkubectl logs job/db-migrate --namespace \"$NAMESPACE\"\
+        \ || true\n"
     - name: Wait for the rollout
       run: "kubectl rollout status deployment/api \\\n  --namespace \"${{ secrets.PROJECT_NAME\
         \ }}\" \\\n  --timeout=10m\n"
